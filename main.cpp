@@ -1,19 +1,168 @@
-#include <iostream>
-#include <conio.h>
 #include <windows.h>
+#include <dxgi.h>
+#include <iostream>
 #include <vector>
-using namespace std;
+#include <string>
+#include <algorithm>
+#pragma comment(lib, "dxgi.lib")
 
-const int width = 20;
-const int height = 20;
-int x, y, fruitX, fruitY, score;
-int tailX[100], tailY[100];
-int nTail;
-enum eDirecton { STOP = 0, LEFT, RIGHT, UP, DOWN };
-eDirecton dir;
-bool gameOver;
+struct GPUInfo {
+    std::wstring name;
+    std::wstring description;
+    UINT vendorId;
+    UINT deviceId;
+    SIZE_T dedicatedVideoMemory;
+};
 
-void Setup() {
+std::wstring VendorToString(UINT vendorId) {
+    switch (vendorId) {
+        case 0x8086: return L"Intel";
+        case 0x10DE: return L"NVIDIA";
+        case 0x1002: return L"AMD";
+        default: return L"Unknown";
+    }
+}
+
+std::vector<GPUInfo> EnumerateGPUs() {
+    std::vector<GPUInfo> gpus;
+    IDXGIFactory* pFactory = nullptr;
+    if (FAILED(CreateDXGIFactory(__uuidof(IDXGIFactory), (void**)&pFactory))) {
+        std::wcerr << L"DXGIファクトリの作成に失敗しました。" << std::endl;
+        return gpus;
+    }
+    UINT i = 0;
+    IDXGIAdapter* pAdapter = nullptr;
+    while (pFactory->EnumAdapters(i, &pAdapter) != DXGI_ERROR_NOT_FOUND) {
+        DXGI_ADAPTER_DESC desc;
+        pAdapter->GetDesc(&desc);
+        GPUInfo info;
+        info.name = desc.Description;
+        info.vendorId = desc.VendorId;
+        info.deviceId = desc.DeviceId;
+        info.dedicatedVideoMemory = desc.DedicatedVideoMemory;
+        info.description = VendorToString(desc.VendorId);
+        gpus.push_back(info);
+        pAdapter->Release();
+        ++i;
+    }
+    pFactory->Release();
+    return gpus;
+}
+
+void SetPowerScheme(const std::wstring& scheme) {
+    if (scheme == L"high") {
+        system("powercfg /setactive SCHEME_MIN"); // 高パフォーマンス
+    } else if (scheme == L"balanced") {
+        system("powercfg /setactive SCHEME_BALANCED"); // バランス
+    }
+}
+
+void SetDefaultGPU(const GPUInfo& gpu) {
+    // Windows 10以降ではアプリごとに既定GPUを設定できるが、
+    // システム全体の既定GPUはレジストリ・ポリシー・ドライバ依存のため、
+    // ここではユーザーに推奨をCLIで明示する。
+    std::wcout << L"\n[最適化] 推奨GPU: " << gpu.name << L" (" << gpu.description << L") を既定に設定してください。" << std::endl;
+    std::wcout << L"    → 設定方法: 設定 > システム > ディスプレイ > グラフィックの設定" << std::endl;
+}
+
+// Windows 10/11のアプリごとGPU設定（レジストリ書き換え）
+#include <shlobj.h>
+#include <atlbase.h>
+
+void SetAppPreferredGPU(const std::wstring& appPath, int gpuPreference) {
+    // gpuPreference: 1=省電力, 2=高パフォーマンス
+    // レジストリ: HKEY_CURRENT_USER\Software\Microsoft\DirectX\UserGpuPreferences
+    HKEY hKey;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\DirectX\\UserGpuPreferences", 0, NULL, 0, KEY_SET_VALUE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
+        std::wstring value = std::to_wstring(gpuPreference);
+        value += L";";
+        RegSetValueExW(hKey, appPath.c_str(), 0, REG_SZ, (const BYTE*)value.c_str(), (DWORD)((value.size() + 1) * sizeof(wchar_t)));
+        RegCloseKey(hKey);
+    }
+}
+
+int main() {
+    auto gpus = EnumerateGPUs();
+    std::wcout << L"=== GPU一覧 (DXGIによる列挙) ===" << std::endl;
+    int idx = 0;
+    for (const auto& gpu : gpus) {
+        std::wcout << L"[" << idx++ << L"] " << gpu.name << L" (" << gpu.description << L")" << std::endl;
+        std::wcout << L"    VendorId: 0x" << std::hex << gpu.vendorId << std::dec << std::endl;
+        std::wcout << L"    DeviceId: 0x" << std::hex << gpu.deviceId << std::dec << std::endl;
+        std::wcout << L"    VRAM   : " << (gpu.dedicatedVideoMemory / (1024 * 1024)) << L" MB" << std::endl;
+    }
+    // 最適GPU自動判定（VRAM最大かつdGPU優先）
+    GPUInfo* best = nullptr;
+    SIZE_T maxVRAM = 0;
+    for (auto& gpu : gpus) {
+        if ((gpu.vendorId == 0x10DE || gpu.vendorId == 0x1002) && gpu.dedicatedVideoMemory > maxVRAM) {
+            best = &gpu;
+            maxVRAM = gpu.dedicatedVideoMemory;
+        }
+    }
+    if (!best) {
+        for (auto& gpu : gpus) {
+            if (gpu.dedicatedVideoMemory > maxVRAM) {
+                best = &gpu;
+                maxVRAM = gpu.dedicatedVideoMemory;
+            }
+        }
+    }
+    if (best) {
+        SetDefaultGPU(*best);
+        SetPowerScheme(L"high");
+        std::wcout << L"[最適化] 電源プランを高パフォーマンスに設定しました。" << std::endl;
+        // 主要アプリのパス例（必要に応じて追加・変更可）
+        std::vector<std::wstring> apps = {
+            L"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+            L"C:\\Program Files\\Blender Foundation\\Blender 3.6\\blender.exe",
+            L"C:\\Windows\\System32\\notepad.exe",
+            L"C:\\Python39\\python.exe"
+        };
+        std::wcout << L"\n[GPU割り当て] 以下のアプリを高パフォーマンスGPUで動作するよう自動設定しました：" << std::endl;
+        for (const auto& app : apps) {
+            SetAppPreferredGPU(app, 2); // 2=高パフォーマンス
+            std::wcout << L"  - " << app << std::endl;
+        }
+        std::wcout << L"\n※反映にはWindows再起動またはサインアウトが必要な場合があります。" << std::endl;
+    } else {
+        std::wcout << L"[最適化] 適切なGPUが見つかりませんでした。" << std::endl;
+    }
+    std::wcout << L"\n自動最適化が完了しました。ウィンドウを閉じてください。" << std::endl;
+    return 0;
+}
+
+    auto gpus = EnumerateGPUs();
+    PrintGPUs(gpus);
+    std::wcout << L"\n[操作] q:終了, l:ログON/OFF (interval=2sec)" << std::endl;
+    bool logging = false;
+    std::ofstream ofs;
+    if (logging) ofs.open("gpu_metrics.csv", std::ios::app);
+    while (true) {
+        if (_kbhit()) {
+            int ch = _getch();
+            if (ch == 'q') break;
+            if (ch == 'l') {
+                logging = !logging;
+                if (logging) {
+                    ofs.open("gpu_metrics.csv", std::ios::app);
+                    std::wcout << L"[LOG] ログ記録ON" << std::endl;
+                } else {
+                    ofs.close();
+                    std::wcout << L"[LOG] ログ記録OFF" << std::endl;
+                }
+            }
+        }
+        auto metrics = QueryGPUMetrics();
+        PrintMetrics(metrics);
+        if (logging && ofs.is_open()) AppendMetricsCSV(metrics, ofs);
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+    }
+    if (ofs.is_open()) ofs.close();
+    std::wcout << L"終了しました。" << std::endl;
+    return 0;
+}
+
     gameOver = false;
     dir = STOP;
     x = width / 2;
